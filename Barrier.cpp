@@ -1,4 +1,4 @@
-#include "Barrier/Barrier.h"
+#include "Barrier.h"
 #include <cstdlib>
 #include <cstdio>
 

@@ -58,18 +58,16 @@ struct JobContext
     const InputVec *inputVec;
     OutputVec *outputVec;
     int threadsNum;
-    JobState jobState;
     // all threads
     pthread_t *threads;
     ThreadContext **contexts;
     // counters for state calculations
     std::atomic<uint64_t> counter;
-    uint64_t totalToShuffle;
-    uint64_t totalToReduce;
     std::vector<IntermediateVec*> shuffleOutput;
     // Mutexes
     pthread_mutex_t outputVecMutex{};
     pthread_mutex_t jobMutex{};
+    pthread_mutex_t atomicMutex{};
     std::vector<pthread_mutex_t> mutexes;
     // Barriers
     Barrier *reduceBarrier;
@@ -77,8 +75,7 @@ struct JobContext
     bool joinedFlag;
     // C'tor
     JobContext(const MapReduceClient *client, const InputVec &inputVec, OutputVec &outputVec, int multiThreadLevel)
-    : counter(0), jobState{MAP_STAGE, 0},
-      totalToShuffle(0), mutexes(multiThreadLevel - 1), joinedFlag(false), totalToReduce(0)
+    : counter(0), mutexes(multiThreadLevel - 1), joinedFlag(false)
     {
       this->client = client;
       this->inputVec = &inputVec;
@@ -95,6 +92,7 @@ struct JobContext
       }
       mutexAction (this->outputVecMutex, INIT);
       mutexAction (this->jobMutex, INIT);
+      mutexAction(this->atomicMutex, INIT);
       for (int i = 0; i < (multiThreadLevel - 1); ++i)
         mutexAction (this->mutexes.at (i), INIT);
     }
@@ -122,16 +120,19 @@ struct JobContext
 void threadMap(void *context)
 {
     auto *tc = (ThreadContext *) context;
-    while (tc->job->counter < tc->job->inputVec->size())
+    while (((tc->job->counter.load() << 33) >> 33) < tc->job->inputVec->size())
     {
         mutexAction (tc->job->mutexes.at (tc->tid), LOCK);
         // if there are still pair to pull from inputVec, pull them.
         uint64_t curr_count = (tc->job->counter)++;
+        curr_count = (curr_count << 33) >> 33;
         if (curr_count < tc->job->inputVec->size())
         {
             InputPair p = tc->job->inputVec->at(curr_count);
             tc->job->client->map(p.first, p.second, tc);
         }
+        else
+            (tc->job->counter)--;
         mutexAction (tc->job->mutexes.at (tc->tid), UNLOCK);
     }
 }
@@ -139,6 +140,7 @@ void threadMap(void *context)
 // code for shuffle stage for thread 0
 void shuffle(ThreadContext* tc){
     std::vector<IntermediateVec*> all_vectors;
+    all_vectors.reserve(tc->job->threadsNum);
     // combining all vectors
     for (int i = 0; i < tc->job->threadsNum; ++ i) {
         // get number of items to shuffle (to be used in getState)
@@ -168,13 +170,11 @@ void shuffle(ThreadContext* tc){
             while (! vec->empty() && !(*vec->back().first < *max_key)) {
                 new_vec->push_back(vec->back());
                 vec->pop_back();
-                tc->job->counter ++;
+                (tc->job->counter++);
             }
         }
         tc->job->shuffleOutput.push_back(new_vec);
     }
-  // number of unique keys (value to be used in getState).
-  tc->job->totalToReduce = tc->job->shuffleOutput.size();
 }
 
 // code for step Reduce for each thread
@@ -185,9 +185,10 @@ void threadReduce(void *context)
   while(!tc->job->shuffleOutput.empty())
   {
     IntermediateVec *vec = tc->job->shuffleOutput.back();
+    uint64_t vecSize = vec->size();
     tc->job->shuffleOutput.pop_back();
     tc->job->client->reduce (vec, tc->job);
-    tc->job->counter++;
+    (tc->job->counter) += vecSize;
   }
   mutexAction (tc->job->outputVecMutex, UNLOCK);
 }
@@ -208,16 +209,23 @@ void *runThread(void *arg)
   threadMap(tc);
   // sort phase
   std::sort(tc->mapOutput->begin(), tc->mapOutput->end(), cmp);
+  (tc->job->counter) += (tc->mapOutput->size() << 31);
   tc->job->shuffleBarrier->barrier();
   // shuffle phase - Only thread 0 shuffles.
   if (tc->tid == 0)
   {
-    tc->job->jobState.stage = SHUFFLE_STAGE;
-    tc->job->totalToShuffle = tc->job->counter;
-    tc->job->counter.store(0);
-    shuffle(tc);
-    tc->job->jobState.stage = REDUCE_STAGE;
-    tc->job->counter.store(0);
+      uint64_t temp;
+      // delete current count, update stage to SHUFFLE
+      mutexAction(tc->job->atomicMutex, LOCK);
+      temp = (((tc->job->counter) >> 31) << 31) + (1UL << 62);
+      (tc->job->counter) = temp;
+      mutexAction(tc->job->atomicMutex, UNLOCK);
+      shuffle(tc);
+      // move current shuffle count to totalToReduce, update stage to REDUCE
+      mutexAction(tc->job->atomicMutex, LOCK);
+      temp = (((tc->job->counter) << 33) >> 2) + (3UL << 62);
+      (tc->job->counter) = temp;
+      mutexAction(tc->job->atomicMutex, UNLOCK);
   }
   tc->job->reduceBarrier->barrier();
   // reduce phase
@@ -274,6 +282,7 @@ JobHandle startMapReduceJob(const MapReduceClient &client,
             exit(EXIT_FAILURE);
           }
     }
+    job->counter += 1UL << 62;
     for (int j = 0; j < multiThreadLevel; ++j)
     {
         if (pthread_create(job->threads + j, NULL, runThread, job->contexts[j]) != 0)
@@ -290,7 +299,7 @@ JobHandle startMapReduceJob(const MapReduceClient &client,
  * @param job job to wait for
  */
 void waitForJob(JobHandle job) {
-    JobContext *j = (JobContext *) job;
+    auto *j = (JobContext *) job;
     if (!j->joinedFlag)
     {
         mutexAction (j->jobMutex, LOCK);
@@ -314,26 +323,29 @@ void waitForJob(JobHandle job) {
  */
 void getJobState(JobHandle job, JobState *state) {
     auto *j = (JobContext *) job;
-  mutexAction (j->jobMutex, LOCK);
+    mutexAction(j->atomicMutex, LOCK);
     // find out job state and percentage completed
-    switch(j->jobState.stage)
+    uint64_t count = j->counter.load();
+    switch(count >> 62)
       {
         case(MAP_STAGE):
           state->stage = MAP_STAGE;
-          state->percentage =  100.f * (float) j->counter / (float) j->inputVec->size();
+          state->percentage =  100.f * (float) ((count << 33) >> 33) / (float) j->inputVec->size();
           break;
         case(SHUFFLE_STAGE):
           state->stage = SHUFFLE_STAGE;
-          state->percentage = 100.f * (float) j->counter / (float) j->totalToShuffle;
+          state->percentage = 100.f * (float) ((count << 33) >> 33) / (float) ((count << 2) >> 33);
           break;
         case(REDUCE_STAGE):
           state->stage = REDUCE_STAGE;
-          state->percentage = 100.f * (float) j->counter / (float) j->totalToReduce;
+          state->percentage = 100.f * (float) ((count << 33) >> 33) / (float) ((count << 2) >> 33);
           break;
         case UNDEFINED_STAGE:
+            state->stage = UNDEFINED_STAGE;
+            state->percentage = 0;
           break;
       }
-  mutexAction (j->jobMutex, UNLOCK);
+      mutexAction(j->atomicMutex, UNLOCK);
 }
 
 /**
